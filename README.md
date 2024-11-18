@@ -3,6 +3,8 @@
 Democratizing Biomolecular Interaction Modeling
 </h1>
 
+![](docs/boltz-1.webp)
+
 ![](docs/boltz1_pred_figure.png)
 
 Boltz-1 is an open-source model which predicts the 3D structure of proteins, rna, dna and small molecules; it handles modified residues, covalent ligands and glycans, as well as condition the generation on pocket residues. 
