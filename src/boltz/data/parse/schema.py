@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
 
+import click
 import numpy as np
 from rdkit import rdBase
 from rdkit.Chem import AllChem
@@ -328,7 +329,7 @@ def parse_ccd_residue(
 def parse_polymer(
     sequence: list[str],
     entity: str,
-    entity_type: str,
+    chain_type: str,
     components: dict[str, Mol],
 ) -> Optional[ParsedChain]:
     """Process a sequence into a chain object.
@@ -359,34 +360,35 @@ def parse_polymer(
         If the alignment fails.
 
     """
+    ref_res = set(const.tokens)
     unk_chirality = const.chirality_type_ids[const.unk_chirality_type]
-
-    # Check what type of sequence this is
-    if entity_type == "rna":
-        chain_type = const.chain_type_ids["RNA"]
-        token_map = const.rna_letter_to_token
-    elif entity_type == "dna":
-        chain_type = const.chain_type_ids["DNA"]
-        token_map = const.dna_letter_to_token
-    elif entity_type == "protein":
-        chain_type = const.chain_type_ids["PROTEIN"]
-        token_map = const.prot_letter_to_token
-    else:
-        msg = f"Unknown polymer type: {entity_type}"
-        raise ValueError(msg)
 
     # Get coordinates and masks
     parsed = []
-    for res_idx, res_code in enumerate(sequence):
+    for res_idx, res_name in enumerate(sequence):
+        # Check if modified residue
+        # Map MSE to MET
+        res_corrected = res_name if res_name != "MSE" else "MET"
+
+        # Handle non-standard residues
+        if res_corrected not in ref_res:
+            ref_mol = components[res_corrected]
+            residue = parse_ccd_residue(
+                name=res_corrected,
+                ref_mol=ref_mol,
+                res_idx=res_idx,
+            )
+            parsed.append(residue)
+            continue
+
         # Load ref residue
-        res_name = token_map[res_code]
-        ref_mol = components[res_name]
+        ref_mol = components[res_corrected]
         ref_mol = AllChem.RemoveHs(ref_mol, sanitize=False)
         ref_conformer = get_conformer(ref_mol)
 
         # Only use reference atoms set in constants
         ref_name_to_atom = {a.GetProp("name"): a for a in ref_mol.GetAtoms()}
-        ref_atoms = [ref_name_to_atom[a] for a in const.ref_atoms[res_name]]
+        ref_atoms = [ref_name_to_atom[a] for a in const.ref_atoms[res_corrected]]
 
         # Iterate, always in the same order
         atoms: list[ParsedAtom] = []
@@ -419,12 +421,12 @@ def parse_polymer(
                 )
             )
 
-        atom_center = const.res_to_center_atom_id[res_name]
-        atom_disto = const.res_to_disto_atom_id[res_name]
+        atom_center = const.res_to_center_atom_id[res_corrected]
+        atom_disto = const.res_to_disto_atom_id[res_corrected]
         parsed.append(
             ParsedResidue(
-                name=res_name,
-                type=const.token_ids[res_name],
+                name=res_corrected,
+                type=const.token_ids[res_corrected],
                 atoms=atoms,
                 bonds=[],
                 idx=res_idx,
@@ -528,7 +530,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     # Go through entities and parse them
     chains: dict[str, ParsedChain] = {}
     chain_to_msa: dict[str, str] = {}
-    chain_to_moltype: dict[str, int] = {}
+    entity_to_seq: dict[str, str] = {}
+    is_msa_custom = False
+    is_msa_auto = False
     for entity_id, items in enumerate(items_to_group.values()):
         # Get entity type and sequence
         entity_type = next(iter(items[0].keys())).lower()
@@ -536,38 +540,76 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         # Ensure all the items share the same msa
         msa = -1
         if entity_type == "protein":
-            if ("msa" not in items[0][entity_type]) or (
-                items[0][entity_type]["msa"] is None
-            ):
-                msg = """
-                Proteins must have an MSA. If you wish to run the model in
-                single sequence mode, please explicitely pass an empty string.
-                """
-                raise ValueError(msg)
-            msa = items[0][entity_type]["msa"]
-            if not all(item[entity_type]["msa"] == msa for item in items):
-                msg = "All proteins with the same sequence must share the same MSA!"
-                raise ValueError(msg)
+            # Get the msa, default to 0, meaning auto-generated
+            msa = items[0][entity_type].get("msa", 0)
+            if (msa is None) or (msa == ""):
+                msa = 0
+
+            # Check if all MSAs are the same within the same entity
+            for item in items:
+                item_msa = item[entity_type].get("msa", 0)
+                if (item_msa is None) or (item_msa == ""):
+                    item_msa = 0
+
+                if item_msa != msa:
+                    msg = "All proteins with the same sequence must share the same MSA!"
+                    raise ValueError(msg)
+
+            # Set the MSA, warn if passed in single-sequence mode
+            if msa == "empty":
+                msa = -1
+                msg = (
+                    "Found explicit empty MSA for some proteins, will run "
+                    "these in single sequence mode. Keep in mind that the "
+                    "model predictions will be suboptimal without an MSA."
+                )
+                click.echo(msg)
+
+            if msa not in (0, -1):
+                is_msa_custom = True
+            elif msa == 0:
+                is_msa_auto = True
 
         # Parse a polymer
         if entity_type in {"protein", "dna", "rna"}:
-            seq = list(items[0][entity_type]["sequence"])
+            # Get token map
+            if entity_type == "rna":
+                token_map = const.rna_letter_to_token
+            elif entity_type == "dna":
+                token_map = const.dna_letter_to_token
+            elif entity_type == "protein":
+                token_map = const.prot_letter_to_token
+            else:
+                msg = f"Unknown polymer type: {entity_type}"
+                raise ValueError(msg)
+
+            # Get polymer info
+            chain_type = const.chain_type_ids[entity_type.upper()]
+            unk_token = const.unk_token[entity_type.upper()]
+
+            # Extract sequence
+            seq = items[0][entity_type]["sequence"]
+            entity_to_seq[entity_id] = seq
+
+            # Convert sequence to tokens
+            seq = [token_map.get(c, unk_token) for c in list(seq)]
+
             # Apply modifications
-            for modification in items[0][entity_type].get("modifications", []):
-                code = modification["ccd"]
-                idx = modification["position"] - 1  # 1-indexed
+            for mod in items[0][entity_type].get("modifications", []):
+                code = mod["ccd"]
+                idx = mod["position"] - 1  # 1-indexed
                 seq[idx] = code
 
             # Parse a polymer
             parsed_chain = parse_polymer(
                 sequence=seq,
                 entity=entity_id,
-                entity_type=entity_type,
+                chain_type=chain_type,
                 components=ccd,
             )
 
         # Parse a non-polymer
-        elif entity_type == "ligand" and "ccd" in items[0][entity_type]:
+        elif (entity_type == "ligand") and "ccd" in (items[0][entity_type]):
             seq = items[0][entity_type]["ccd"]
             if isinstance(seq, str):
                 seq = [seq]
@@ -592,7 +634,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 residues=residues,
                 type=const.chain_type_ids["NONPOLYMER"],
             )
-        elif entity_type == "ligand" and "smiles" in items[0][entity_type]:
+        elif (entity_type == "ligand") and ("smiles" in items[0][entity_type]):
             seq = items[0][entity_type]["smiles"]
             mol = AllChem.MolFromSmiles(seq)
             mol = AllChem.AddHs(mol)
@@ -622,11 +664,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             msg = f"Invalid entity type: {entity_type}"
             raise ValueError(msg)
 
-        # Convert entity_type to mol_type_id
-        mol_type_id = entity_type.upper()
-        mol_type_id = mol_type_id.replace("LIGAND", "NONPOLYMER")
-        mol_type_id = const.chain_type_ids[mol_type_id]
-
+        # Add as many chains as provided ids
         for item in items:
             ids = item[entity_type]["id"]
             if isinstance(ids, str):
@@ -634,7 +672,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             for chain_name in ids:
                 chains[chain_name] = parsed_chain
                 chain_to_msa[chain_name] = msa
-                chain_to_moltype[chain_name] = mol_type_id
+
+    # Check if msa is custom or auto
+    if is_msa_custom and is_msa_auto:
+        msg = "Cannot mix custom and auto-generated MSAs in the same input!"
+        raise ValueError(msg)
 
     # If no chains parsed fail
     if not chains:
@@ -733,9 +775,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     constraints = schema.get("constraints", [])
     for constraint in constraints:
         if "bond" in constraint:
-            c1, r1, a1 = atom_idx_map[tuple(constraint["bond"]["atom1"])]
-            c2, r2, a2 = atom_idx_map[tuple(constraint["bond"]["atom2"])]
-            connections.append((c1, c2, r1 - 1, r2 - 1, a1, a2))  # 1-indexed
+            c1, r1, a1 = tuple(constraint["bond"]["atom1"])
+            c2, r2, a2 = tuple(constraint["bond"]["atom2"])
+            c1, r1, a1 = atom_idx_map[(c1, r1 - 1, a1)]  # 1-indexed
+            c2, r2, a2 = atom_idx_map[(c2, r2 - 1, a2)]  # 1-indexed
+            connections.append((c1, c2, r1, r2, a1, a2))
 
         elif "pocket" in constraint:
             binder = constraint["pocket"]["binder"]
@@ -768,15 +812,16 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     # Create metadata
     struct_info = StructureInfo(num_chains=len(chains))
     chain_infos = []
-    for chain_id, chain in enumerate(chains):
+    for chain in chains:
         chain_info = ChainInfo(
-            chain_id=chain_id,
+            chain_id=int(chain["asym_id"]),
             chain_name=chain["name"],
-            mol_type=chain_to_moltype[chain["name"]],
+            mol_type=int(chain["mol_type"]),
             cluster_id=-1,
             msa_id=chain_to_msa[chain["name"]],
             num_residues=int(chain["res_num"]),
             valid=True,
+            entity_id=int(chain["entity_id"]),
         )
         chain_infos.append(chain_info)
 
@@ -786,4 +831,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         chains=chain_infos,
         interfaces=[],
     )
-    return Target(record=record, structure=data)
+    return Target(
+        record=record,
+        structure=data,
+        sequences=entity_to_seq,
+    )

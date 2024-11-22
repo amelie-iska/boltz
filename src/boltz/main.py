@@ -8,10 +8,12 @@ import click
 import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.strategies import DDPStrategy
-from rdkit.Chem.rdchem import Mol
+from pytorch_lightning.utilities import rank_zero_only
 from tqdm import tqdm
 
+from boltz.data import const
 from boltz.data.module.inference import BoltzInferenceDataModule
+from boltz.data.msa.mmseqs2 import run_mmseqs2
 from boltz.data.parse.a3m import parse_a3m
 from boltz.data.parse.fasta import parse_fasta
 from boltz.data.parse.yaml import parse_yaml
@@ -19,8 +21,8 @@ from boltz.data.types import MSA, Manifest, Record
 from boltz.data.write.writer import BoltzWriter
 from boltz.model.model import Boltz1
 
-CCD_URL = "https://www.dropbox.com/scl/fi/h4mjhcbhzzkkj4piu1k6x/ccd.pkl?rlkey=p43trjrs9ots4qk84ygk24seu&st=bymcsoqe&dl=1"
-MODEL_URL = "https://www.dropbox.com/scl/fi/8qo9aryyttzp97z74dchn/boltz1.ckpt?rlkey=jvxl2jsn0kajnyfmesbj4lb89&st=dipi1sbw&dl=1"
+CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
+MODEL_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1.ckpt"
 
 
 @dataclass
@@ -52,6 +54,7 @@ class BoltzDiffusionParams:
     use_inference_model_cache: bool = True
 
 
+@rank_zero_only
 def download(cache: Path) -> None:
     """Download all the required data.
 
@@ -61,22 +64,22 @@ def download(cache: Path) -> None:
         The cache directory.
 
     """
-    # Warn user, just in case
-    click.echo(
-        f"Downloading data and model to {cache}. "
-        "You may change this by setting the --cache flag."
-    )
-
-    # Download CCD, while capturing the output
+    # Download CCD
     ccd = cache / "ccd.pkl"
     if not ccd.exists():
-        click.echo(f"Downloading CCD to {ccd}.")
+        click.echo(
+            f"Downloading the CCD dictionary to {ccd}. You may "
+            "change the cache directory with the --cache flag."
+        )
         urllib.request.urlretrieve(CCD_URL, str(ccd))  # noqa: S310
 
     # Download model
     model = cache / "boltz1.ckpt"
     if not model.exists():
-        click.echo(f"Downloading model to {model}")
+        click.echo(
+            f"Downloading the model weights to {model}. You may "
+            "change the cache directory with the --cache flag."
+        )
         urllib.request.urlretrieve(MODEL_URL, str(model))  # noqa: S310
 
 
@@ -140,7 +143,13 @@ def check_inputs(
     # Remove them from the input data
     if existing and not override:
         data = [d for d in data if d.stem not in existing]
-        msg = "Found existing predictions, skipping and running only the missing ones."
+        num_skipped = len(existing) - len(data)
+        msg = (
+            f"Found some existing predictions ({num_skipped}), "
+            f"skipping and running only the missing ones, "
+            "if any. If you wish to override these existing "
+            "predictions, please set the --override flag."
+        )
         click.echo(msg)
     elif existing and override:
         msg = "Found existing predictions, will override."
@@ -149,12 +158,43 @@ def check_inputs(
     return data
 
 
-def process_inputs(  # noqa: C901
+def compute_msa(data: dict[str, str], msa_dir: Path, msa_server_url:str, msa_pairing_strategy:str) -> list[Path]:
+    """Compute the MSA for the input data.
+
+    Parameters
+    ----------
+    data : dict[str, str]
+        The input protein sequences.
+    msa_dir : Path
+        The msa temp directory.
+
+    Returns
+    -------
+    list[Path]
+        The list of MSA files.
+
+    """
+    # Run MMSeqs2
+    msa = run_mmseqs2(list(data.values()), msa_dir, use_pairing=len(data) > 1, host_url=msa_server_url, pairing_strategy=msa_pairing_strategy)
+
+    # Dump to A3M
+    for idx, key in enumerate(data):
+        entity_msa = msa[idx]
+        msa_path = msa_dir / f"{key}.a3m"
+        with msa_path.open("w") as f:
+            f.write(entity_msa)
+
+
+@rank_zero_only
+def process_inputs(  # noqa: C901, PLR0912, PLR0915
     data: list[Path],
     out_dir: Path,
-    ccd: dict[str, Mol],
+    ccd_path: Path,
+    msa_server_url: str,
+    msa_pairing_strategy: str,
     max_msa_seqs: int = 4096,
-) -> BoltzProcessedInput:
+    use_msa_server: bool = False,
+) -> None:
     """Process the input data and output directory.
 
     Parameters
@@ -163,10 +203,12 @@ def process_inputs(  # noqa: C901
         The input data.
     out_dir : Path
         The output directory.
-    ccd : dict[str, Mol]
-        The CCD dictionary.
+    ccd_path : Path
+        The path to the CCD dictionary.
     max_msa_seqs : int, optional
         Max number of MSA seuqneces, by default 4096.
+    use_msa_server : bool, optional
+        Whether to use the MMSeqs2 server for MSA generation, by default False.
 
     Returns
     -------
@@ -177,14 +219,20 @@ def process_inputs(  # noqa: C901
     click.echo("Processing input data.")
 
     # Create output directories
+    msa_dir = out_dir / "msa"
     structure_dir = out_dir / "processed" / "structures"
     processed_msa_dir = out_dir / "processed" / "msa"
     predictions_dir = out_dir / "predictions"
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    msa_dir.mkdir(parents=True, exist_ok=True)
     structure_dir.mkdir(parents=True, exist_ok=True)
-    predictions_dir.mkdir(parents=True, exist_ok=True)
     processed_msa_dir.mkdir(parents=True, exist_ok=True)
+    predictions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load CCD
+    with ccd_path.open("rb") as file:
+        ccd = pickle.load(file)  # noqa: S301
 
     # Parse input data
     records: list[Record] = []
@@ -204,6 +252,60 @@ def process_inputs(  # noqa: C901
             )
             raise RuntimeError(msg)
 
+        # Get target id
+        target_id = target.record.id
+
+        # Get all MSA ids and decide whether to generate MSA
+        to_generate = {}
+        prot_id = const.chain_type_ids["PROTEIN"]
+        for chain in target.record.chains:
+            # Add to generate list, assigning entity id
+            if (chain.mol_type == prot_id) and (chain.msa_id == 0):
+                entity_id = chain.entity_id
+                msa_id = f"{target_id}_{entity_id}"
+                to_generate[msa_id] = target.sequences[entity_id]
+                chain.msa_id = msa_dir / f"{msa_id}.a3m"
+
+            # We do not support msa generation for non-protein chains
+            elif chain.msa_id == 0:
+                chain.msa_id = -1
+
+        # Generate MSA
+        if to_generate and not use_msa_server:
+            msg = "Missing MSA's in input and --use_msa_server flag not set."
+            raise RuntimeError(msg)
+
+        if to_generate:
+            msg = f"Generating MSA for {path} with {len(to_generate)} protein entities."
+            click.echo(msg)
+            compute_msa(to_generate, msa_dir, msa_server_url=msa_server_url, msa_pairing_strategy=msa_pairing_strategy)
+
+        # Parse MSA data
+        msas = {c.msa_id for c in target.record.chains if c.msa_id != -1}
+        msa_id_map = {}
+        for msa_idx, msa_id in enumerate(msas):
+            # Check that raw MSA exists
+            msa_path = Path(msa_id)
+            if not msa_path.exists():
+                msg = f"MSA file {msa_path} not found."
+                raise FileNotFoundError(msg)
+
+            # Dump processed MSA
+            processed = processed_msa_dir / f"{target_id}_{msa_idx}.npz"
+            msa_id_map[msa_id] = f"{target_id}_{msa_idx}"
+            if not processed.exists():
+                msa: MSA = parse_a3m(
+                    msa_path,
+                    taxonomy=None,
+                    max_seqs=max_msa_seqs,
+                )
+                msa.dump(processed)
+
+        # Modify records to point to processed MSA
+        for c in target.record.chains:
+            if (c.msa_id != -1) and (c.msa_id in msa_id_map):
+                c.msa_id = msa_id_map[c.msa_id]
+
         # Keep record
         records.append(target.record)
 
@@ -211,42 +313,9 @@ def process_inputs(  # noqa: C901
         struct_path = structure_dir / f"{target.record.id}.npz"
         target.structure.dump(struct_path)
 
-    # Parse MSA data
-    msas = {chain.msa_id for r in records for chain in r.chains if chain.msa_id != -1}
-    msa_id_map = {}
-    for msa_idx, msa_id in enumerate(msas):
-        # Check that raw MSA exists
-        msa_path = Path(msa_id)
-        if not msa_path.exists():
-            msg = f"MSA file {msa_path} not found."
-            raise FileNotFoundError(msg)
-
-        # Dump processed MSA
-        processed = processed_msa_dir / f"{msa_idx}.npz"
-        msa_id_map[msa_id] = msa_idx
-        if not processed.exists():
-            msa: MSA = parse_a3m(
-                msa_path,
-                taxonomy=None,
-                max_seqs=max_msa_seqs,
-            )
-            msa.dump(processed)
-
-    # Modify records to point to processed MSA
-    for record in records:
-        for c in record.chains:
-            if c.msa_id != -1 and c.msa_id in msa_id_map:
-                c.msa_id = msa_id_map[c.msa_id]
-
     # Dump manifest
     manifest = Manifest(records)
     manifest.dump(out_dir / "processed" / "manifest.json")
-
-    return BoltzProcessedInput(
-        manifest=manifest,
-        targets_dir=structure_dir,
-        msa_dir=processed_msa_dir,
-    )
 
 
 @click.group()
@@ -322,6 +391,23 @@ def cli() -> None:
     is_flag=True,
     help="Whether to override existing found predictions. Default is False.",
 )
+@click.option(
+    "--use_msa_server",
+    is_flag=True,
+    help="Whether to use the MMSeqs2 server for MSA generation. Default is False.",
+)
+@click.option(
+    "--msa_server_url",
+    type=str,
+    help="MSA server url. Used only if --use_msa_server is set. ",
+    default="https://api.colabfold.com",
+)
+@click.option(
+    "--msa_pairing_strategy",
+    type=str,
+    help="Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'",
+    default="greedy",
+)
 def predict(
     data: str,
     out_dir: str,
@@ -335,6 +421,9 @@ def predict(
     output_format: Literal["pdb", "mmcif"] = "mmcif",
     num_workers: int = 2,
     override: bool = False,
+    use_msa_server: bool = False,
+    msa_server_url: str = "https://api.colabfold.com",
+    msa_pairing_strategy: str = "greedy",
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -358,18 +447,34 @@ def predict(
     # Download necessary data and model
     download(cache)
 
-    # Load CCD
-    ccd_path = cache / "ccd.pkl"
-    with ccd_path.open("rb") as file:
-        ccd = pickle.load(file)  # noqa: S301
-
-    # Set checkpoint
-    if checkpoint is None:
-        checkpoint = cache / "boltz1.ckpt"
-
-    # Check if data is a directory
+    # Validate inputs
     data = check_inputs(data, out_dir, override)
-    processed = process_inputs(data, out_dir, ccd)
+    if not data:
+        click.echo("No predictions to run, exiting.")
+        return
+
+    msg = f"Running predictions for {len(data)} structure"
+    msg += "s" if len(data) > 1 else ""
+    click.echo(msg)
+
+    # Process inputs
+    ccd_path = cache / "ccd.pkl"
+    process_inputs(
+        data=data,
+        out_dir=out_dir,
+        ccd_path=ccd_path,
+        use_msa_server=use_msa_server,
+        msa_server_url=msa_server_url,
+        msa_pairing_strategy=msa_pairing_strategy,
+    )
+
+    # Load processed data
+    processed_dir = out_dir / "processed"
+    processed = BoltzProcessedInput(
+        manifest=Manifest.load(processed_dir / "manifest.json"),
+        targets_dir=processed_dir / "structures",
+        msa_dir=processed_dir / "msa",
+    )
 
     # Create data module
     data_module = BoltzInferenceDataModule(
@@ -380,6 +485,9 @@ def predict(
     )
 
     # Load model
+    if checkpoint is None:
+        checkpoint = cache / "boltz1.ckpt"
+
     predict_args = {
         "recycling_steps": recycling_steps,
         "sampling_steps": sampling_steps,
