@@ -3,7 +3,7 @@
 Democratizing Biomolecular Interaction Modeling
 </h1>
 
-![](docs/boltz-I_logo.webp)
+![](docs/image0.jpg)
 
 Boltz-1 is an open-source model, named after Ludwig Boltzmann, which predicts the 3D structure of proteins, RNA, DNA and small molecules; it handles modified residues, covalent ligands and glycans, as well as the ability to condition the generation on pocket residues. Future improvements and finetunes of Boltz-1 may allow us to predict Boltzmann distributions of biomolecular complexes, similar to the way AlphaFlow, DiG, and MDGen do. Additionally, retraining Boltz-1 with a flow-matching objective instead of diffusion may allow us to speed up inference significantly, improve performance, and add additional functionality such as the ability to interpolate conformations or inpainting. 
 
