@@ -167,7 +167,9 @@ As an example, to predict a structure using 10 recycling steps and 25 samples (t
 | `--max_msa_seqs`          | `INTEGER`       | `8192` |The maximum number of MSA sequences to use for prediction.                                                                                                                             |
 | `--subsample_msa`          | `FLAG`       | `False` | Whether to subsample the MSA.                                                                                                                             |
 | `--num_subsampled_msa`          | `INTEGER`       | `1024` | The number of MSA sequences to subsample.                                                                                                                             |
-| `--no_trifast`          | `FLAG`       | `False` | Whether to not use trifast kernels for triangular updates..                                                                                                                             |
+| `--no_trifast`          | `FLAG`       | `False` | Whether to not use trifast kernels for triangular updates.. |
+| `--fsdp`                | `FLAG`       | `False` | Enable Fully Sharded Data Parallel to shard the model across GPUs. |
+| `--fsdp_min_num_params` | `INTEGER`    | `10000000` | Minimum number of parameters for a module to be wrapped by FSDP. |
 | `--override`             | `FLAG`          | `False`                     | Whether to override existing predictions if found.                                                                                                                                  |
 | `--use_msa_server`       | `FLAG`          | `False`                     | Whether to use the msa server to generate msa's.                                                                                                                                    |
 | `--msa_server_url`       | str             | `https://api.colabfold.com` | MSA server url. Used only if --use_msa_server is set.                                                                                                                               |

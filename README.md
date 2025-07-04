@@ -43,6 +43,10 @@ You can run inference using Boltz with:
 boltz predict input_path --use_msa_server
 ```
 
+If your model does not fit in memory on a single GPU, you can shard the model across
+multiple GPUs by adding the `--fsdp` flag (optionally set `--fsdp_min_num_params` to
+control wrapping).
+
 `input_path` should point to a YAML file, or a directory of YAML files for batched processing, describing the biomolecules you want to model and the properties you want to predict (e.g. affinity). To see all available options: `boltz predict --help` and for more information on these input formats, see our [prediction instructions](docs/prediction.md). By default, the `boltz` command will run the latest version of the model.
 
 ### Binding Affinity Prediction

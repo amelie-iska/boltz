@@ -934,6 +934,17 @@ def cli() -> None:
     is_flag=True,
     help="Whether to disable the kernels. Default False",
 )
+@click.option(
+    "--fsdp",
+    is_flag=True,
+    help="Enable Fully Sharded Data Parallel (FSDP) to shard the model across GPUs",
+)
+@click.option(
+    "--fsdp_min_num_params",
+    type=int,
+    help="Minimum number of parameters for a module to be wrapped by FSDP.",
+    default=10_000_000,
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -967,6 +978,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     subsample_msa: bool = True,
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
+    fsdp: bool = False,
+    fsdp_min_num_params: int = 10_000_000,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1076,13 +1089,44 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         ),
     )
 
+    precision_value = 32 if model == "boltz1" else "bf16-mixed"
+
     # Set up trainer
     strategy = "auto"
     if (isinstance(devices, int) and devices > 1) or (
         isinstance(devices, list) and len(devices) > 1
     ):
         start_method = "fork" if platform.system() != "win32" else "spawn"
-        strategy = DDPStrategy(start_method=start_method)
+        if fsdp:
+            from pytorch_lightning.strategies import FSDPStrategy
+            from pytorch_lightning.plugins.precision import FSDPPrecision
+            from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+            from lightning_utilities.core.apply_func import apply_to_collection
+            from torch import Tensor
+
+            class SafeFSDPPrecision(FSDPPrecision):
+                """Allow frozen dataclasses in batches."""
+
+                def convert_input(self, data: object) -> object:
+                    return apply_to_collection(
+                        data,
+                        Tensor,
+                        lambda t: t.to(self._desired_input_dtype)
+                        if t.is_floating_point()
+                        else t,
+                        allow_frozen=True,
+                    )
+
+            strategy = FSDPStrategy(
+                start_method=start_method,
+                auto_wrap_policy=size_based_auto_wrap_policy(
+                    min_num_params=fsdp_min_num_params
+                ),
+                precision_plugin=SafeFSDPPrecision(precision_value),
+            )
+        else:
+            strategy = DDPStrategy(start_method=start_method)
+
         if len(filtered_manifest.records) < devices:
             msg = (
                 "Number of requested devices is greater "
@@ -1127,7 +1171,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         callbacks=[pred_writer],
         accelerator=accelerator,
         devices=devices,
-        precision=32 if model == "boltz1" else "bf16-mixed",
+        precision=precision_value,
     )
 
     if filtered_manifest.records:
