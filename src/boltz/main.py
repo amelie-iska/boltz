@@ -14,7 +14,7 @@ from typing import Literal, Optional
 import click
 import torch
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.strategies import DDPStrategy, FSDPStrategy
 from pytorch_lightning.utilities import rank_zero_only
 from rdkit import Chem
 from tqdm import tqdm
@@ -186,7 +186,7 @@ def download_boltz1(cache: Path) -> None:
             try:
                 urllib.request.urlretrieve(url, str(model))  # noqa: S310
                 break
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 if i == len(BOLTZ1_URL_WITH_FALLBACK) - 1:
                     msg = f"Failed to download model from all URLs. Last error: {e}"
                     raise RuntimeError(msg) from e
@@ -233,7 +233,7 @@ def download_boltz2(cache: Path) -> None:
             try:
                 urllib.request.urlretrieve(url, str(model))  # noqa: S310
                 break
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 if i == len(BOLTZ2_URL_WITH_FALLBACK) - 1:
                     msg = f"Failed to download model from all URLs. Last error: {e}"
                     raise RuntimeError(msg) from e
@@ -250,7 +250,7 @@ def download_boltz2(cache: Path) -> None:
             try:
                 urllib.request.urlretrieve(url, str(affinity_model))  # noqa: S310
                 break
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 if i == len(BOLTZ2_AFFINITY_URL_WITH_FALLBACK) - 1:
                     msg = f"Failed to download model from all URLs. Last error: {e}"
                     raise RuntimeError(msg) from e
@@ -934,6 +934,11 @@ def cli() -> None:
     is_flag=True,
     help="Whether to disable the kernels. Default False",
 )
+@click.option(
+    "--fsdp",
+    is_flag=True,
+    help="Enable Fully Sharded Data Parallel for multi-GPU inference.",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -967,6 +972,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     subsample_msa: bool = True,
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
+    fsdp: bool = False,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1078,7 +1084,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
     # Set up trainer
     strategy = "auto"
-    if (isinstance(devices, int) and devices > 1) or (
+    if fsdp:
+        strategy = FSDPStrategy()
+    elif (isinstance(devices, int) and devices > 1) or (
         isinstance(devices, list) and len(devices) > 1
     ):
         start_method = "fork" if platform.system() != "win32" else "spawn"
